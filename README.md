@@ -1,6 +1,6 @@
 # WARC Revisit Replay API
 
-基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供十一个接口：
+基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供十二个接口：
 
 - `POST /v1/replay`：接收 Base64 编码的自包含 WARC，按 `WARC-Record-ID` 建索引，
   将 `revisit` 记录沿 `WARC-Refers-To` 引用链还原到终点 `response` 的正文；
@@ -39,6 +39,11 @@
   `gzip_warc`（Base64）与各记录 ID 的压缩 `offset`/`length`（连续、互不
   重叠）；末记录缺 `Content-Length` 时补入准确块长，整包解压后交给
   `/v1/replay` 与输入一致，解压后超过 2 MiB 返回 422。
+- `POST /v1/subresource-integrity`：接收 WARC、起始 URL 与时点，还原最终
+  页面后逐项核对 HTML 中带 `integrity` 的 `script[src]` 与样式表
+  `link[href]`（按 DOM 序、不按 URL 去重）：只比较最强算法
+  （sha512/sha384/sha256）的 Base64 摘要与资源终点还原正文，无抓取、
+  跳转失败或非 2xx 逐项报原因，不中断其他项。
 
 ## 一条命令启动（端口 8000）
 
@@ -1103,11 +1108,153 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 # 把结果作为 warc 字段 POST 给 /v1/replay
 ```
 
+### `POST /v1/subresource-integrity`
+
+在 `/v1/navigate` 的时点选取与重定向跟随之上，核对最终页面 HTML 中
+`script[src]` 与样式表 `link[href]` 标签的 **`integrity`** 属性
+（Subresource Integrity）：把每个资源在该时点还原出的正文与标签声明的
+摘要逐一比对。
+
+请求体（与 `/v1/navigate` 相同）：
+
+| 字段   | 类型   | 说明 |
+|--------|--------|------|
+| `warc` | string | **Base64 编码**的 WARC；解码后 **≤ 2 MiB**，支持 gzip（单流或多 member）。 |
+| `url`  | string | 起始 **HTTP(S)** 绝对 URL。 |
+| `at`   | string | **RFC3339** 时点，建议 UTC（如 `2021-05-05T10:00:00Z`）。 |
+
+处理规则：
+
+- 先用与 `/v1/navigate` **完全相同**的规则还原最终页面（时点选取 + 跟随
+  重定向）；根页面无抓取（**404**）、重定向异常或归档错误（**422**）时，
+  响应与原接口一致，不进入核验；
+- 只处理**带 `integrity` 属性**的 `script[src]` 与 `rel=stylesheet` 的
+  `link[href]`（标签/属性名大小写不敏感；`rel` 按空白分词后包含
+  `stylesheet` 即算）；不带 `integrity` 的标签不参与核验；
+- 相对地址按**首个有效** `<base href>` 解析（规则同 `/v1/page-assets`；
+  没有有效 base 时用最终页 URL），去掉片段后只保留 HTTP(S) 地址
+  （`data:`、`javascript:` 等直接跳过，不计入结果）；
+- 带 `integrity` 的标签**按 DOM 顺序逐项处理，不按 URL 去重**：同一
+  URL 出现多次即产生多个条目，各自独立核验；
+- 每个资源**独立**按同一时点选取抓取并跟随重定向（同样最多 8 跳）；
+  无抓取、重定向异常、终点非 2xx 都只在对应条目上标明原因，**不中断
+  其余条目**；抓取类失败原因优先于摘要核验——资源无法还原到 2xx 终点
+  时不再读取 `integrity` 内容；
+- 到达 **2xx** 终点后核验 `integrity`：属性值按空白拆分为若干 token，
+  仅 `sha256`/`sha384`/`sha512`（算法名大小写不敏感）加**标准 Base64**
+  摘要（允许缺省填充；解码后长度须等于算法摘要长度 32/48/64 字节）算
+  **合法摘要**，其余 token（未知算法、Base64 非法、长度不符）一律忽略；
+  没有任何合法摘要 → `invalid_integrity`；
+- 有合法摘要时**只比较其中最强的算法**（sha512 > sha384 > sha256）：
+  对终点记录的还原正文（revisit 已还原为链终点 response 的正文）计算
+  该算法摘要，任一合法摘要与之相同即 `match`，全部不同即 `mismatch`。
+
+响应（`200`）：
+
+| 字段                | 含义 |
+|---------------------|------|
+| `final_url`         | 最终页面 URL（根页面重定向跟随后的终点） |
+| `total`             | 参与核验的标签总数（按 DOM 序，含重复 URL） |
+| `matched`           | 核验通过（`result` 为 `match`）的条目数 |
+| `items`             | 逐项核验结果，按标签在 HTML 中的 DOM 顺序 |
+| `items[].tag`       | 来源标签：`script` / `link`（rel=stylesheet） |
+| `items[].url`       | 资源的绝对 URL（已按 base 解析、去片段） |
+| `items[].record_id` | 终点记录的 `WARC-Record-ID` 原始值；未到达终点为 `null` |
+| `items[].result`    | 核验结果（见下） |
+
+`items[].result` 取值：`match`（最强算法的任一合法摘要匹配还原正文）、
+`mismatch`（有合法摘要但无一匹配）、`invalid_integrity`（没有任何合法
+摘要）、`capture_not_found`（时点前无抓取）、`status_not_2xx`（终点
+状态非 2xx，含 revisit 自身无 HTTP 头状态为 `null`）、
+`missing_location` / `invalid_redirect_target` / `redirect_cycle` /
+`too_many_redirects`（重定向异常，含义与 `/v1/navigate` 的同名错误一致）。
+
+#### 示例
+
+先用 Python 造一份样例归档：页面声明三个带 `integrity` 的资源——
+`style.css` 摘要正确、`app.js` 摘要与归档正文不符、`missing.js` 在归档
+中没有抓取：
+
+```bash
+python3 - <<'EOF' > sample-sri.warc
+import base64, hashlib, sys
+
+def sri(algo, data):
+    digest = hashlib.new(algo, data).digest()
+    return f"{algo}-{base64.b64encode(digest).decode()}"
+
+css = b"body { color: black; }"
+js = b"alert(1)"
+html = (
+    "<html><head>"
+    f'<link rel="stylesheet" href="/style.css" integrity="{sri("sha384", css)}">'
+    "</head><body>"
+    # app.js 声明的摘要与归档正文不符（按 alert(2) 声明）
+    f'<script src="/app.js" integrity="{sri("sha256", b"alert(2)")}"></script>'
+    # missing.js 在归档中没有抓取
+    f'<script src="/missing.js" integrity="{sri("sha256", js)}"></script>'
+    "</body></html>"
+).encode()
+
+def rec(rid, uri, body, ctype, date="2021-01-01T00:00:00Z"):
+    http = (f"HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n").encode() + body
+    return (
+        f"WARC/1.1\r\nWARC-Type: response\r\nWARC-Record-ID: {rid}\r\n"
+        f"WARC-Date: {date}\r\nWARC-Target-URI: {uri}\r\n"
+        f"Content-Type: application/http; msgtype=response\r\n"
+        f"Content-Length: {len(http)}\r\n\r\n"
+    ).encode() + http + b"\r\n\r\n"
+
+out = rec("<urn:uuid:page>", "http://example.com/", html, "text/html")
+out += rec("<urn:uuid:css>", "http://example.com/style.css", css, "text/css")
+out += rec("<urn:uuid:js>", "http://example.com/app.js", js,
+           "application/javascript")
+sys.stdout.buffer.write(out)
+EOF
+
+curl -s http://localhost:8000/v1/subresource-integrity \
+  -H 'Content-Type: application/json' \
+  -d "{\"warc\":\"$(base64 -w0 sample-sri.warc)\", \
+       \"url\":\"http://example.com/\", \
+       \"at\":\"2021-06-01T00:00:00Z\"}"
+```
+
+响应（按 DOM 序逐项返回；三项互不干扰——匹配、失配、无抓取各自标明）：
+
+```json
+{
+  "final_url": "http://example.com/",
+  "total": 3,
+  "matched": 1,
+  "items": [
+    {
+      "tag": "link",
+      "url": "http://example.com/style.css",
+      "record_id": "<urn:uuid:css>",
+      "result": "match"
+    },
+    {
+      "tag": "script",
+      "url": "http://example.com/app.js",
+      "record_id": "<urn:uuid:js>",
+      "result": "mismatch"
+    },
+    {
+      "tag": "script",
+      "url": "http://example.com/missing.js",
+      "record_id": null,
+      "result": "capture_not_found"
+    }
+  ]
+}
+```
+
 ## 错误处理（HTTP 422 / 404）
 
-输入与结构错误统一返回 **422**；`/v1/navigate`、`/v1/page-assets` 与
-`/v1/site-reachability` 在某一跳无合格抓取时返回 **404**（后两者仅**根页面**
-无抓取返回 404）。响应体形如：
+输入与结构错误统一返回 **422**；`/v1/navigate`、`/v1/page-assets`、
+`/v1/site-reachability` 与 `/v1/subresource-integrity` 在某一跳无合格
+抓取时返回 **404**（后三者仅**根页面**无抓取返回 404）。响应体形如：
 
 ```json
 {
@@ -1118,7 +1265,7 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 }
 ```
 
-十一个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
+十二个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
 先旧后新；`/v1/merge` 同样对左、右两包各自独立校验，先左后右）：
 
 | `error`                        | 触发条件                                         | 附加字段 |
@@ -1164,12 +1311,15 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 | 422  | `invalid_cursor`       | `cursor` 不是合法的 Base64URL JSON、结构/版本非法、绑定的解压后归档 SHA-256 不符（跨包使用），或它指向的排序键在归档中不存在 | `reason`（`malformed` / `unsupported_version` / `archive_mismatch` / `stale_cursor`） |
 
 `/v1/navigate` 额外的错误（其中 `invalid_at`、`invalid_capture_date` 同样
-适用于 `/v1/snapshot-diff`、`/v1/page-assets` 与 `/v1/site-reachability`，
-`invalid_capture_date` 亦适用于 `/v1/capture-index`；snapshot-diff 不涉及
-重定向，也没有 404。`/v1/page-assets` 的**根页面**与 `/v1/site-reachability`
-的**首页**均与 `/v1/navigate` 走同一套选取与重定向逻辑，下表错误全部原样
-适用；page-assets 的**静态资源**与 site-reachability 的**子链接**的同类失败
-不会使整个请求失败——前者逐项标记在 `assets[].error` 中，后者直接跳过）：
+适用于 `/v1/snapshot-diff`、`/v1/page-assets`、`/v1/site-reachability` 与
+`/v1/subresource-integrity`，`invalid_capture_date` 亦适用于
+`/v1/capture-index`；snapshot-diff 不涉及重定向，也没有 404。
+`/v1/page-assets` 的**根页面**、`/v1/site-reachability` 的**首页**与
+`/v1/subresource-integrity` 的**根页面**均与 `/v1/navigate` 走同一套选取
+与重定向逻辑，下表错误全部原样适用；page-assets 的**静态资源**、
+site-reachability 的**子链接**与 subresource-integrity 的**带 integrity
+标签**的同类失败不会使整个请求失败——前两者分别逐项标记在
+`assets[].error` 中、直接跳过，后者逐项标记在 `items[].result` 中）：
 
 | HTTP | `error`                   | 触发条件                                   | 附加字段 |
 |------|---------------------------|--------------------------------------------|----------|
@@ -1249,6 +1399,7 @@ app/
   merge.py         # /v1/merge：双包原序合并、跨包冲突确定性改名与末记录补长
   http_exchanges.py# /v1/http-exchanges：WARC-Concurrent-To 显式配对与交换重建
   member_pack.py   # /v1/member-pack：逐记录独立 gzip member 打包、固定时间戳与定位范围
+  subresource_integrity.py # /v1/subresource-integrity：integrity 摘要解析、最强算法比较与逐项核验
 tests/
   test_replay.py
   test_extract.py
@@ -1261,6 +1412,7 @@ tests/
   test_merge.py
   test_http_exchanges.py
   test_member_pack.py
+  test_subresource_integrity.py
 Dockerfile
 docker-compose.yml
 requirements.txt
