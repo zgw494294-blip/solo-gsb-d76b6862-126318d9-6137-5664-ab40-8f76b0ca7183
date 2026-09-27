@@ -19,10 +19,11 @@ from .page_assets import page_assets
 from .replay import ReplayError, replay
 from .site_reachability import site_reachability
 from .snapshot_diff import snapshot_diff
+from .subresource_integrity import subresource_integrity
 
 app = FastAPI(
     title="WARC Replay API",
-    version="1.10.0",
+    version="1.11.0",
     description="接收 Base64 编码的自包含 WARC：/v1/replay 还原 response/revisit "
     "记录，/v1/extract 按记录 ID 导出子集（含引用链传递依赖），"
     "/v1/navigate 按时点离线还原页面（跟随重定向），"
@@ -38,7 +39,11 @@ app = FastAPI(
     "侧的 WARC-Concurrent-To 显式关联重建 request 与 response/revisit 的 "
     "HTTP 交换（允许前向引用，URL/时间相同不配对），/v1/member-pack 把 "
     "response/revisit 记录按归档原序逐记录打成独立 gzip member，生成可按"
-    "记录定位的多 member gzip（固定 gzip 时间戳，输出确定）。",
+    "记录定位的多 member gzip（固定 gzip 时间戳，输出确定），"
+    "/v1/subresource-integrity 核对最终页面 HTML 中带 integrity 的 "
+    "script[src] 与样式表 link[href]：按首个有效 base 解析 URL、按 DOM 序"
+    "逐项（不去重）以最强算法（sha256/sha384/sha512）的合法 Base64 摘要"
+    "比对资源终点的还原正文，逐项报告标签、URL、终点记录与结果。",
 )
 
 
@@ -516,3 +521,57 @@ class MemberPackResponse(BaseModel):
           status_code=200)
 async def post_member_pack(payload: MemberPackRequest) -> dict[str, Any]:
     return member_pack(payload.warc)
+
+
+class SubresourceIntegrityRequest(BaseModel):
+    warc: str = Field(
+        ...,
+        description="Base64 编码的 WARC 数据（可带空白/换行），解码后不超过 2 MiB",
+    )
+    url: str = Field(..., description="起始 HTTP(S) URL（绝对地址）")
+    at: str = Field(
+        ...,
+        description="RFC3339 时点（建议 UTC，如 2021-05-05T10:00:00Z）",
+    )
+
+
+class IntegrityCheckItem(BaseModel):
+    tag: str = Field(..., description="来源标签：script / link（rel=stylesheet）")
+    url: str = Field(
+        ..., description="资源的绝对 URL（已按首个有效 base 解析、去片段；"
+        "同一 URL 被多个标签引用时逐项重复出现）"
+    )
+    ok: bool = Field(
+        ..., description="最强算法的任一合法 Base64 摘要匹配资源终点的还原"
+        "正文即 true"
+    )
+    record_id: Optional[str] = Field(
+        None, description="终点记录的 WARC-Record-ID 原始值；未到达终点为 null"
+    )
+    http_status: Optional[int] = Field(
+        None, description="终点记录自己的 HTTP 状态码；未到达终点为 null"
+    )
+    error: Optional[str] = Field(
+        None, description="失败原因：invalid_integrity / integrity_mismatch / "
+        "capture_not_found / status_not_2xx / missing_location / "
+        "invalid_redirect_target / redirect_cycle / too_many_redirects；"
+        "通过时为 null"
+    )
+
+
+class SubresourceIntegrityResponse(BaseModel):
+    final_url: str = Field(
+        ..., description="最终页面 URL（根页面重定向跟随后的终点）"
+    )
+    total: int = Field(..., description="参与核验的 integrity 标签总数")
+    valid: int = Field(..., description="核验通过（摘要匹配）的标签数量")
+    checks: list[IntegrityCheckItem] = Field(
+        ..., description="逐项核验结果，按标签在 HTML 中的 DOM 序"
+    )
+
+
+@app.post("/v1/subresource-integrity",
+          response_model=SubresourceIntegrityResponse, status_code=200)
+async def post_subresource_integrity(
+        payload: SubresourceIntegrityRequest) -> dict[str, Any]:
+    return subresource_integrity(payload.warc, payload.url, payload.at)

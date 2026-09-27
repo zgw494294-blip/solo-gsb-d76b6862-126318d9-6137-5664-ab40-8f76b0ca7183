@@ -1,6 +1,6 @@
 # WARC Revisit Replay API
 
-基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供十一个接口：
+基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供十二个接口：
 
 - `POST /v1/replay`：接收 Base64 编码的自包含 WARC，按 `WARC-Record-ID` 建索引，
   将 `revisit` 记录沿 `WARC-Refers-To` 引用链还原到终点 `response` 的正文；
@@ -39,6 +39,13 @@
   `gzip_warc`（Base64）与各记录 ID 的压缩 `offset`/`length`（连续、互不
   重叠）；末记录缺 `Content-Length` 时补入准确块长，整包解压后交给
   `/v1/replay` 与输入一致，解压后超过 2 MiB 返回 422。
+- `POST /v1/subresource-integrity`：接收 Base64 WARC、页面 URL 与 RFC3339
+  时点，按 `/v1/navigate` 的时点选取、重定向跟随与 revisit 还原得到最终
+  页面，核对其中**带 integrity** 的 `script[src]` 与样式表 `link[href]`：
+  按首个有效 `<base href>` 解析 URL、按 DOM 序逐项（不按 URL 去重）只
+  比较最强算法（sha512 > sha384 > sha256）的合法 Base64 摘要与资源终点
+  的还原正文，逐项返回标签、URL、终点记录 ID 与结果（无合法摘要记
+  `invalid_integrity`；抓取、跳转失败或非 2xx 逐项标原因，不中断其他项）。
 
 ## 一条命令启动（端口 8000）
 
@@ -1103,11 +1110,121 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 # 把结果作为 warc 字段 POST 给 /v1/replay
 ```
 
+### `POST /v1/subresource-integrity`
+
+在 `/v1/navigate` 的时点选取与重定向跟随之上，核对最终页面 HTML 中
+**带 `integrity` 属性**的 `script[src]` 与 `rel=stylesheet` 的
+`link[href]` 的 Subresource Integrity（SRI）。
+
+请求体（与 `/v1/navigate` 相同）：
+
+| 字段   | 类型   | 说明 |
+|--------|--------|------|
+| `warc` | string | **Base64 编码**的 WARC；解码后 **≤ 2 MiB**，支持 gzip（单流或多 member）。 |
+| `url`  | string | 起始 **HTTP(S)** 绝对 URL。 |
+| `at`   | string | **RFC3339** 时点，建议 UTC（如 `2021-05-05T10:00:00Z`）。 |
+
+处理规则：
+
+- 先用与 `/v1/navigate` **完全相同**的规则还原最终页面（时点选取 + 跟随
+  重定向 + revisit 正文还原）；根页面无抓取（**404**）、重定向异常或归档
+  错误（**422**）时，响应与原接口一致，不进入核验；
+- 只处理**带 `integrity` 属性**的 `script[src]` 与样式表 `link[href]`
+  （标签/属性名大小写不敏感；`rel` 按空白分词后包含 `stylesheet` 即算）；
+  不带 `integrity` 的标签不计入结果；
+- 相对地址按**首个有效** `<base href>` 解析（规则同 `/v1/page-assets`），
+  去掉片段后只保留 HTTP(S) 绝对地址（`data:`、`javascript:` 等直接忽略）；
+  **不按 URL 去重**——同一 URL 被多个标签引用时每个标签各算一项，结果
+  按标签在 HTML 中的 **DOM 序**返回；
+- `integrity` 按空白拆分为若干 token，仅 `sha256`/`sha384`/`sha512` 且
+  摘要部分为合法 Base64（解码长度恰为该算法摘要长度）的 token 算
+  **合法摘要**，其余 token（未知算法、非法 Base64、长度不符等）一律
+  忽略；没有任何合法摘要 → 该项记 `invalid_integrity`（不再抓取资源）；
+- 只比较合法摘要中**最强的算法**（sha512 > sha384 > sha256）：每个资源
+  独立按同一时点选取抓取并跟随重定向（同样最多 8 跳），终点记录自己的
+  HTTP 状态为 2xx 时，任一该算法摘要与终点记录的**还原正文**（revisit
+  已沿引用链还原到终点 response 的正文）逐字节相同即通过；无一匹配记
+  `integrity_mismatch`；
+- 无抓取、终点非 2xx、重定向异常（缺 Location、目标非法、成环、超跳数）
+  都只在对应条目上标明原因（`error` 字段），**不使整页失败**。
+
+响应（`200`）：
+
+| 字段                   | 含义 |
+|------------------------|------|
+| `final_url`            | 最终页面 URL（根页面重定向跟随后的终点） |
+| `total`                | 参与核验的 integrity 标签总数 |
+| `valid`                | 核验通过（摘要匹配）的标签数量 |
+| `checks`               | 逐项核验结果，按标签在 HTML 中的 DOM 序；每项见下 |
+| `checks[].tag`         | 来源标签：`script` / `link`（rel=stylesheet） |
+| `checks[].url`         | 资源的绝对 URL（已按 base 解析、去片段；同一 URL 可重复出现） |
+| `checks[].ok`          | 最强算法的任一合法摘要匹配终点还原正文即 `true` |
+| `checks[].record_id`   | 终点记录的 `WARC-Record-ID` 原始值；未到达终点为 `null` |
+| `checks[].http_status` | 终点记录**自己**的 HTTP 状态码；未到达终点为 `null` |
+| `checks[].error`       | 失败原因（见下）；通过时为 `null` |
+
+`checks[].error` 取值：`invalid_integrity`（没有任何合法摘要，未抓取）、
+`integrity_mismatch`（终点 2xx 但最强算法摘要无一匹配）、
+`capture_not_found`（时点前无抓取）、`status_not_2xx`（终点状态非 2xx，
+含 revisit 自身无 HTTP 头状态为 `null` 的情形）、`missing_location` /
+`invalid_redirect_target` / `redirect_cycle` / `too_many_redirects`
+（重定向异常，含义与 `/v1/navigate` 的同名错误一致）。
+
+#### 示例
+
+```bash
+curl -s http://localhost:8000/v1/subresource-integrity \
+  -H 'Content-Type: application/json' \
+  -d "{\"warc\":\"$(base64 -w0 sample.warc)\", \
+       \"url\":\"http://example.com/\", \
+       \"at\":\"2021-06-01T00:00:00Z\"}"
+```
+
+假设最终页面 HTML 为（`app.js` 的 integrity 与其正文匹配，`style.css`
+的故意不匹配）：
+
+```html
+<html><head><link rel="stylesheet" href="/style.css"
+  integrity="sha256-+rSBHplSBoV1oMiWYUdFjCtqdNPOSdyNWkWyJgZ+p08="></head>
+<body><script src="https://cdn.example.com/app.js"
+  integrity="sha256-Aqg81WB3fsDjPYW8ncUP7I3hCMVclFRDy2CL+mW+mIQ="></script>
+</body></html>
+```
+
+响应（逐项按 DOM 序；`style.css` 摘要无一匹配记 `integrity_mismatch`，
+不影响 `app.js` 通过）：
+
+```json
+{
+  "final_url": "http://example.com/",
+  "total": 2,
+  "valid": 1,
+  "checks": [
+    {
+      "tag": "link",
+      "url": "http://example.com/style.css",
+      "ok": false,
+      "record_id": "<urn:uuid:css>",
+      "http_status": 200,
+      "error": "integrity_mismatch"
+    },
+    {
+      "tag": "script",
+      "url": "https://cdn.example.com/app.js",
+      "ok": true,
+      "record_id": "<urn:uuid:js>",
+      "http_status": 200,
+      "error": null
+    }
+  ]
+}
+```
+
 ## 错误处理（HTTP 422 / 404）
 
-输入与结构错误统一返回 **422**；`/v1/navigate`、`/v1/page-assets` 与
-`/v1/site-reachability` 在某一跳无合格抓取时返回 **404**（后两者仅**根页面**
-无抓取返回 404）。响应体形如：
+输入与结构错误统一返回 **422**；`/v1/navigate`、`/v1/page-assets`、
+`/v1/site-reachability` 与 `/v1/subresource-integrity` 在某一跳无合格
+抓取时返回 **404**（后三者仅**根页面**无抓取返回 404）。响应体形如：
 
 ```json
 {
@@ -1118,7 +1235,7 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 }
 ```
 
-十一个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
+十二个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
 先旧后新；`/v1/merge` 同样对左、右两包各自独立校验，先左后右）：
 
 | `error`                        | 触发条件                                         | 附加字段 |
@@ -1164,12 +1281,15 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 | 422  | `invalid_cursor`       | `cursor` 不是合法的 Base64URL JSON、结构/版本非法、绑定的解压后归档 SHA-256 不符（跨包使用），或它指向的排序键在归档中不存在 | `reason`（`malformed` / `unsupported_version` / `archive_mismatch` / `stale_cursor`） |
 
 `/v1/navigate` 额外的错误（其中 `invalid_at`、`invalid_capture_date` 同样
-适用于 `/v1/snapshot-diff`、`/v1/page-assets` 与 `/v1/site-reachability`，
-`invalid_capture_date` 亦适用于 `/v1/capture-index`；snapshot-diff 不涉及
-重定向，也没有 404。`/v1/page-assets` 的**根页面**与 `/v1/site-reachability`
-的**首页**均与 `/v1/navigate` 走同一套选取与重定向逻辑，下表错误全部原样
-适用；page-assets 的**静态资源**与 site-reachability 的**子链接**的同类失败
-不会使整个请求失败——前者逐项标记在 `assets[].error` 中，后者直接跳过）：
+适用于 `/v1/snapshot-diff`、`/v1/page-assets`、`/v1/site-reachability` 与
+`/v1/subresource-integrity`，`invalid_capture_date` 亦适用于
+`/v1/capture-index`；snapshot-diff 不涉及重定向，也没有 404。
+`/v1/page-assets` 与 `/v1/subresource-integrity` 的**根页面**、
+`/v1/site-reachability` 的**首页**均与 `/v1/navigate` 走同一套选取与
+重定向逻辑，下表错误全部原样适用；page-assets 的**静态资源**、
+subresource-integrity 的**受核验资源**与 site-reachability 的**子链接**
+的同类失败不会使整个请求失败——前两者逐项标记在 `assets[].error` /
+`checks[].error` 中，后者直接跳过）：
 
 | HTTP | `error`                   | 触发条件                                   | 附加字段 |
 |------|---------------------------|--------------------------------------------|----------|
@@ -1249,6 +1369,7 @@ app/
   merge.py         # /v1/merge：双包原序合并、跨包冲突确定性改名与末记录补长
   http_exchanges.py# /v1/http-exchanges：WARC-Concurrent-To 显式配对与交换重建
   member_pack.py   # /v1/member-pack：逐记录独立 gzip member 打包、固定时间戳与定位范围
+  subresource_integrity.py # /v1/subresource-integrity：integrity 解析、最强算法选取与逐项 SRI 核验
 tests/
   test_replay.py
   test_extract.py
@@ -1261,6 +1382,7 @@ tests/
   test_merge.py
   test_http_exchanges.py
   test_member_pack.py
+  test_subresource_integrity.py
 Dockerfile
 docker-compose.yml
 requirements.txt
